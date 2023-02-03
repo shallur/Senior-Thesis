@@ -1,0 +1,414 @@
+---
+title: "BCF Model with Propensity Score"
+output:
+  pdf_document:
+    fig_caption: yes
+    fig_crop: no
+---
+
+```{r echo=FALSE,warning=FALSE}
+ library(knitr)
+  opts_chunk$set(
+                 external=TRUE,
+                 echo=TRUE,
+                 warning=FALSE
+                )
+```
+
+```{r, include = FALSE}
+library(ggplot2)
+library(tibble)
+library(dplyr)
+library(caret)
+library(bcf)
+library(tidyr)
+library(corrplot)
+library(MatchIt)
+```
+
+## Exploratory Analysis
+
+First, we will examine the spread of the predictors for a randomly selected dataset.
+
+```{r}
+set.seed(100)
+
+# Randomly pick a number
+dataset_database <- c(1:3400)
+sample_num <- sample(dataset_database,1)
+
+# Pull datasets corresponding to above number
+sample_name <- paste("track2_20220404/practice/acic_practice_",
+      formatC(sample_num, width = 4, format = "d", flag = "0"),".csv",sep = "")
+sample_practice <- read.csv(sample_name)
+sample_year_name <- paste("track2_20220404/practice_year/acic_practice_year_",
+              formatC(sample_num, width = 4, format = "d", flag = "0"),".csv",sep = "")
+sample_year <- read.csv(sample_year_name)
+  
+# Left join files by id.practice
+sample_data <- merge(sample_year, sample_practice, by = "id.practice")
+```
+
+Then we will plot each variable to observe the distribution of the predictors and outcomes. This information can help inform future variable transformations.
+
+```{r, fig.height = 2.5, fig.width = 3}
+for (col in c(3,6:13,19:22)) {
+    hist(sample_data[,col], xlab = colnames(sample_data[col]), main = paste("Histogram of",colnames(sample_data[col])))
+}
+```
+
+From the above plots, it appears that the outcome `Y` is slightly right-skewed, as are the predictors `V1_avg`, `V5_B_avg`, `V5_C_avg`, `X6`, and `X7`. By contrast, the predictors `V3_avg`, `V4_avg`, and `V5_A_avg` appear to be slightly left-skewed. 
+
+```{r, fig.height = 2.5, fig.width = 3}
+# Square root transformation for right-skewed data
+for (col in c(3,7,12:13,19:20)) {
+    hist(sample_data[,col]**0.5, xlab = colnames(sample_data[col]), main = paste("Histogram of",colnames(sample_data[col])))
+}
+
+# Square transformation for left-skewed data
+for (col in c(9:11)) {
+    hist((sample_data[,col])**2, xlab = colnames(sample_data[col]), main = paste("Histogram of",colnames(sample_data[col])))
+}
+
+# General log transform for n.patients
+hist(log(sample_data[,6]), xlab = colnames(sample_data[6]), main = paste("Histogram of",colnames(sample_data[6])))
+```
+
+From the above plots, it appears that for all the variables except `V4_avg`, the respective transformations helped normalize the results. These transformed variables will be included in the BART model in place of the regular variables.
+
+Another concern was collinearity resulting from high correlations between predictors, which the following code explores:
+
+```{r}
+corr_data <- within(sample_data, rm(year, X2, X4, n.patients, id.practice))
+corrplot(cor(corr_data), is.corr = FALSE)
+```
+
+From the above plot, it appears that `V3_avg` and `V4_avg` are strongly correlated and both have a strong negative correlations with `V1_avg`. Likewise, `V5_A_avg` appears to be negatively correlated with both `V5_B_avg` and `V5_C_avg`. While BART models are generally resilient against multicollinearity, it is possible that extra information from closely related predictors is skewing the predicted outcomes, so variable selection could reduce model bias.
+
+## Propensity Score Calculation
+
+The following code identifies differences in key predictors between the treatment and control groups.
+
+```{r}
+prop_cov <- c('X1','X2_A','X2_B','X3','X4_A','X4_B','X5','X6','X7','X8','X9','V1_avg','V2_avg','V3_avg','V4_avg','V5_A_avg','V5_B_avg','V5_C_avg')
+comparison_table <- sample_data %>%
+  group_by(Z) %>%
+  group_by(id.practice) %>%
+  mutate(X2_A = sum(X2 == 'A')/n())  %>%
+  mutate(X2_B = sum(X2 == 'B')/n())  %>%
+  mutate(X2_C = sum(X2 == 'C')/n())  %>%
+  mutate(X4_A = sum(X4 == 'A')/n())  %>%
+  mutate(X4_B = sum(X4 == 'B')/n())  %>%
+  mutate(X4_C = sum(X4 == 'C')/n())
+
+comparison_table %>%
+  group_by(Z) %>%
+  group_by(id.practice) %>%
+  select(one_of(prop_cov)) %>%
+  summarise_all(funs(mean(., na.rm = T)))
+```
+
+We then compute the t-test to see if the above differences are statistically significant.
+
+```{r}
+with(comparison_table, t.test(X1 ~ Z))
+# with(comparison_table, t.test(X2_A ~ Z))
+# with(comparison_table, t.test(X2_B ~ Z))
+with(comparison_table, t.test(X3 ~ Z))
+# with(comparison_table, t.test(X4_A ~ Z))
+# with(comparison_table, t.test(X4_B ~ Z))
+with(comparison_table, t.test(X5 ~ Z))
+with(comparison_table, t.test(X6 ~ Z))
+with(comparison_table, t.test(X7 ~ Z))
+with(comparison_table, t.test(X8 ~ Z))
+with(comparison_table, t.test(X9 ~ Z))
+with(comparison_table, t.test(V1_avg ~ Z))
+with(comparison_table, t.test(V2_avg ~ Z))
+with(comparison_table, t.test(V3_avg ~ Z))
+with(comparison_table, t.test(V4_avg ~ Z))
+with(comparison_table, t.test(V5_A_avg ~ Z))
+with(comparison_table, t.test(V5_B_avg ~ Z))
+with(comparison_table, t.test(V5_C_avg ~ Z))
+```
+
+We will next compute the propensity score for each variable.
+
+```{r}
+m_ps <- glm(Z ~ X1 + X2+ X3 + X4 + X5 + X6 + X7 + X8 + X9 + V1_avg + V2_avg + V3_avg + V4_avg + V5_A_avg + V5_B_avg + V5_C_avg,
+            family = binomial(), data = comparison_table)
+summary(m_ps)
+```
+
+We now compute the propensity score for each practice using the above results.
+
+```{r}
+prs_df <- data.frame(pr_score = predict(m_ps, type = "response"),
+                     Z = m_ps$model$Z)
+prs_df
+```
+
+We can check the new differences after accounting for propensity score.
+
+```{r}
+mod_match <- matchit(Z ~ X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + V1_avg + V2_avg + V3_avg + V4_avg + V5_A_avg + V5_B_avg + V5_C_avg,
+                     method = "nearest", data = comparison_table)
+
+dta_m <- match.data(mod_match)
+dim(dta_m)
+
+dta_m %>%
+  group_by(Z) %>%
+  select(one_of(prop_cov)) %>%
+  summarise_all(funs(mean))
+```
+
+```{r}
+with(dta_m, t.test(X1 ~ Z))
+# with(dta_m, t.test(X2_A ~ Z))
+# with(dta_m, t.test(X2_B ~ Z))
+with(dta_m, t.test(X3 ~ Z))
+# with(dta_m, t.test(X4_A ~ Z))
+# with(dta_m, t.test(X4_B ~ Z))
+with(dta_m, t.test(X5 ~ Z))
+with(dta_m, t.test(X6 ~ Z))
+with(dta_m, t.test(X7 ~ Z))
+with(dta_m, t.test(X8 ~ Z))
+with(dta_m, t.test(X9 ~ Z))
+with(dta_m, t.test(V1_avg ~ Z))
+with(dta_m, t.test(V2_avg ~ Z))
+with(dta_m, t.test(V3_avg ~ Z))
+with(dta_m, t.test(V4_avg ~ Z))
+with(dta_m, t.test(V5_A_avg ~ Z))
+with(dta_m, t.test(V5_B_avg ~ Z))
+with(dta_m, t.test(V5_C_avg ~ Z))
+```
+
+
+## BART Design
+
+We will now sample `n` datasets from the 3400 ACIC practice-level files for smaller analysis. 
+
+```{r}
+n = 11
+dataset_nums <- sample(dataset_database,n,replace = FALSE) %>%
+  sort()
+
+# Instantiating dataframe for final output
+final_output <- data.frame(matrix(ncol = 5, nrow = n * 15))
+colnames(final_output) <- c("dataset.num","variable","level","year","SATT")
+
+# Identifying subgroups for subgroup-level SATT calculations
+subgroups <- data.frame(c("X1",0),c("X1",1),c("X2","A"),c("X2","B"),c("X2","C"),
+               c("X3",0),c("X3",1),c("X4","A"),c("X4","B"),c("X4","C"),
+               c("X5",0),c("X5",1))
+```
+
+Next, we run the BART algorithm for each sampled dataset.
+
+```{r,warning = FALSE}
+for (x in dataset_nums){
+  
+  # Creating index variable to add results to final dataset
+  index = dataset_nums %>% {which(. == x)}
+  
+  # Extracting datasets for the selected files
+  practice_i_name <- paste("track2_20220404/practice/acic_practice_",
+                           formatC(x, width = 4, format = "d", flag = "0"),".csv",sep = "")
+  practice_i <- read.csv(practice_i_name)
+  practice_i_year_name <- paste("track2_20220404/practice_year/acic_practice_year_",
+                                formatC(x, width = 4, format = "d", flag = "0"),".csv",sep = "")
+  practice_year_i <- read.csv(practice_i_year_name)
+  
+  # Left join files by id.practice and transform variables
+  practice_data_i <- merge(practice_year_i, practice_i, by = "id.practice") %>%
+    mutate(year = as.factor(year), Z = as.factor(Z), post = as.factor(post), 
+           X1 = as.factor(X1), X2 = as.factor(X2), X3 = as.factor(X3), 
+           X4 = as.factor(X4), X5 = as.factor(X5), Y = Y**0.5,
+           V1_avg = V1_avg**0.5, V3_avg = V3_avg**2,V5_A_avg = V5_A_avg**2, 
+           V5_B_avg = V5_B_avg**0.5, V5_C_avg = V5_C_avg**0.5, X6 = X6**0.5, 
+           X7 = X7**0.5)
+  
+  m_ps <- glm(Z ~ X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + V1_avg + V2_avg + V3_avg + V4_avg + V5_A_avg + V5_B_avg + V5_C_avg,
+            family = binomial(), data = practice_data_i)
+
+  prs_df <- data.frame(pr_score = predict(m_ps, type = "response"),
+                     Z = m_ps$model$Z)
+  
+  practice_data_i <- practice_data_i %>%
+    mutate(prop_score = prs_df[,1])
+  
+  # Segregate data into predictor and outcome variables
+  y <- practice_data_i$Y
+  z <- practice_data_i$Z
+  prop <- practice_data_i$prop_score
+  df <- within(practice_data_i, rm(Y,n.patients,id.practice,Z,prop_score))
+  
+  
+  # Separating practices into test and training datasets
+  test_inds = createDataPartition(y = 1:length(y), p = 0.33, list = F) 
+  df_test = data.matrix(df[test_inds, ])
+  y_test = y[test_inds]
+  z_test = z[test_inds] 
+  prop_test = prop[test_inds]
+  df_train = data.matrix(df[-test_inds, ])
+  y_train = y[-test_inds]
+  z_train = z[-test_inds] 
+  prop_train = prop[-test_inds]
+
+  # Run BCF model
+  bcf_model = bcf(x_control = df_train, y = y_train, z = z_train, pihat = prop_train, nburn = 100, nsim = 1000)
+  
+  # Simple Backwards Elimination Model to eliminate high correlation variables
+  #   at relatively low computational cost
+  corr_vars <- c(3,6,7,16)
+  for (c in corr_vars){
+    df_test_temp <- df_test[,-c]
+    df_train_temp <- df_train[,-c]
+    bcf_challenger <-  bcf(x_control = df_train_temp, y = y_train, z = z_train, pihat = prop_train, nburn = 100, nsim = 1000)
+    model_results <- predict(object=bcf_model,
+                   x_predict_control=df_test,
+                   x_predict_moderate=df_test,
+                   pi_pred=prop_test,
+                   z_pred=z_test,
+                   save_tree_directory = '..')
+    model_RMSE <- sqrt(mean((y_test - model_results)^2))
+    challenger_results <- predict(object=bcf_challenger,
+                   x_predict_control=df_test_temp,
+                   x_predict_moderate=df_test_temp,
+                   pi_pred=prop_test,
+                   z_pred=z_test)
+    challenger_RMSE <- sqrt(mean((y_test - challenger_results)^2))
+    if (challenger_RMSE < model_RMSE){
+      bcf_model <- bcf_challenger
+      df_test <- df_test_temp
+      df_train <- df_train_temp
+      practice_data_i <- practice_data_i[,-(c+4)]
+    }
+  }
+  
+  # Select data corresponding to practices that received the intervention
+  eval_data_i <- data.frame(practice_data_i %>% filter(Z == 1))
+  
+  # Instantiate variables
+  SATT_overall = 0
+  SATT_3 = 0
+  SATT_4 = 0
+  total_patients_3 = 0
+  total_patients_4 = 0
+  
+  # Compute SATT for Overall and Years 3 and 4
+  for (j in unique(eval_data_i$id.practice)){
+      eval_practice_3 <- subset(eval_data_i,(id.practice == j & year == 3))
+      pred_3 <- within(eval_practice_3, rm(Y,Z,n.patients,id.practice))
+      pred_treat_3 <- predict(bcf_model,cbind(pred_3, Z = 1))**2
+      pred_cont_3 <- predict(bcf_model,cbind(pred_3, Z = 0))**2
+      SATT_3 <- SATT_3 + eval_practice_3$n.patients * (pred_treat_3 - pred_cont_3)
+      
+      eval_practice_4 <- subset(eval_data_i,(id.practice == j & year == 4))
+      pred_4 <- within(eval_practice_4, rm(Y,Z,n.patients,id.practice))
+      pred_treat_4 <- predict(bcf_model,cbind(pred_4, Z = 1))**2
+      pred_cont_4 <- predict(bcf_model,cbind(pred_4, Z = 0))**2
+      SATT_4 <- SATT_4 + eval_practice_4$n.patients * (pred_treat_4 - pred_cont_4)
+  }
+  
+  year_3_data <- eval_data_i %>% filter(year == 3)
+  total_patients_3 <- total_patients_3 + sum(year_3_data$n.patients)
+  
+  year_4_data <- eval_data_i %>% filter(year == 4)
+  total_patients_4 <- total_patients_4 + sum(year_4_data$n.patients)
+  
+  SATT_overall <- (SATT_3 + SATT_4)/(total_patients_3 + total_patients_4)
+  SATT_3 <- SATT_3/total_patients_3
+  SATT_4 <- SATT_4/total_patients_4
+  
+  # Store final output in the results dataframe
+  final_output[(index - 1)*15 + 1,] <- c(x,"Overall",NA,NA,SATT_overall)
+  final_output[(index - 1)*15 + 14,] <- c(x,"Yearly",NA,3,SATT_3)
+  final_output[(index - 1)*15 + 15,] <- c(x,"Yearly",NA,4,SATT_4)
+  
+  # Compute SATT for each subgroup and store in the results dataframe
+  for(u in c(1:12)){
+    total_patients_sub <- 0
+    SATT_sub <- 0
+    if (subgroups[2,u] %in% c("A","B","C")){
+      eval_data_sub <- subset(eval_data_i,eval(as.symbol(subgroups[1,u])) == as.character(subgroups[2,u]))
+    }
+    else{
+      eval_data_sub <- subset(eval_data_i,eval(as.symbol(subgroups[1,u])) == as.integer(subgroups[2,u])) 
+    }
+    for(yr in c(3:4)){
+      for (j in unique(eval_data_sub$id.practice)){
+          if (subgroups[2,u] %in% c("A","B","C")){
+            eval_practice_sub <- subset(eval_data_sub,
+                                      (id.practice == j & (eval(as.symbol(subgroups[1,u])) == as.character(subgroups[2,u])) & year == yr))
+          }
+          else{
+            eval_practice_sub <- subset(eval_data_sub,
+                                      (id.practice == j & (eval(as.symbol(subgroups[1,u])) == as.integer(subgroups[2,u])) & year == yr))
+          }
+          
+          pred_sub <- within(eval_practice_sub, rm(Y,Z,n.patients,id.practice))
+          pred_treat_sub <- predict(bcf_model,cbind(pred_sub, Z = 1))**2
+          pred_cont_sub <- predict(bcf_model,cbind(pred_sub, Z = 0))**2
+          SATT_sub <- SATT_sub + eval_practice_sub$n.patients * (pred_treat_sub - pred_cont_sub)
+      }
+      year_data_sub <- eval_data_sub %>% filter(year == yr)
+      total_patients_sub = total_patients_sub + sum(year_data_sub$n.patients)
+    }
+    SATT_sub <- SATT_sub/total_patients_sub
+    final_output[(index - 1)*15 + u + 1,] <- c(x,subgroups[1,u],subgroups[2,u],NA,SATT_sub)
+  }
+}
+```
+
+## Results
+
+After computing the SATT scores for each selected datafile, we then compare the BART model's results to the actual SATT scores shared by the ACIC commission. Final results include overall RMSE, RMSE by year and RMSE by subgroup. 
+
+```{r}
+true_results <- read.csv("ACIC_estimand_truths.csv") %>%
+  filter(is.na(id.practice)) %>%
+  mutate(real_SATT = SATT) %>%
+  select(-SATT)
+
+final_output <- final_output %>%
+  mutate(SATT = as.numeric(SATT)) %>%
+  mutate(year = as.integer(year))
+
+check_results <- merge(final_output, true_results, by = c("dataset.num","variable","level","year"))
+
+check_results %>%
+  group_by(variable,level) %>%
+  summarize(RMSE = sqrt(mean((real_SATT - SATT)^2)))
+```
+
+
+
+```{r}
+check_results %>%
+  filter(variable == "Overall") %>%
+  group_by(Confounding.Strength) %>%
+  summarize(RMSE = sqrt(mean((real_SATT - SATT)^2)))
+
+check_results %>%
+  filter(variable == "Overall") %>%
+  group_by(Confounding.Source) %>%
+  summarize(RMSE = sqrt(mean((real_SATT - SATT)^2)))
+
+check_results %>%
+  filter(variable == "Overall") %>%
+  group_by(Impact.Heterogeneity) %>%
+  summarize(RMSE = sqrt(mean((real_SATT - SATT)^2)))
+
+check_results %>%
+  filter(variable == "Overall") %>%
+  group_by(Idiosyncrasy.of.Impacts) %>%
+  summarize(RMSE = sqrt(mean((real_SATT - SATT)^2)))
+```
+
+```{r}
+check_results[,c(1:4,6:10,5,11)] %>%
+  filter(variable == "Overall") %>%
+  glimpse
+```
+CLearly the BART machine approximates some DGPs closely while widely missing others. Reducing the RMSE will require integrating more complex techniques to address confounding and other systemic issues.
